@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 const sampleFile = "testdata/sample.jsonl"
@@ -132,4 +135,41 @@ func TestKeyOrder(t *testing.T) {
 	if got := out.String(); got != "{\"b\":1,\"a\":2}\n" {
 		t.Errorf("got %q", got)
 	}
+}
+
+func TestRunFilter(t *testing.T) {
+	items, err := loadItems(strings.NewReader(`{"b":1,"a":2} {"b":3,"a":4}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"{", `  "b": 3,`, `  "a": 4`, "}"}
+	check := func(t *testing.T, res runResult) {
+		if res.Err != "" {
+			t.Fatalf("%s: unexpected error %q", res.Engine, res.Err)
+		}
+		got := make([]string, len(res.Lines))
+		for i, l := range res.Lines {
+			got[i] = ansi.Strip(l)
+		}
+		if strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Errorf("%s: got %q", res.Engine, got)
+		}
+	}
+	t.Run("gojq", func(t *testing.T) {
+		t.Setenv("PATH", "")
+		res := runFilter(context.Background(), "select(.a > 2)", items)
+		if res.Engine != "gojq" {
+			t.Fatalf("engine %s", res.Engine)
+		}
+		check(t, res)
+		if res := runFilter(context.Background(), ".a | error", items); !strings.Contains(res.Err, "error") {
+			t.Errorf("missing error: %q", res.Err)
+		}
+	})
+	t.Run("jq", func(t *testing.T) {
+		if _, err := exec.LookPath("jq"); err != nil {
+			t.Skip("jq not found")
+		}
+		check(t, runFilter(context.Background(), "select(.a > 2)", items))
+	})
 }

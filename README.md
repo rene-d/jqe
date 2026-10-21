@@ -66,7 +66,9 @@ A ready-to-paste command line (`jq '…' 'data.json'`) is also printed to stderr
      several build an object `{"name": .path, …}`.
 
    Fields used in the filter are marked with **●** (condition) or **◆** (projection).
-4. Press **`q`** to quit and print the filter.
+4. Press **`r`** to run the filter on the whole input and scroll through the
+   complete output, exactly as `jq` prints it (`esc` to come back).
+5. Press **`q`** to quit and print the filter.
 
 Conditions are chained (logical AND); projections come last:
 
@@ -102,6 +104,7 @@ keywords…) are quoted automatically: `."record-type"`.
 | `Esc`               | tree        | back to the list                                |
 | `f`                 | tree        | add a condition on the field                    |
 | `p`                 | tree        | toggle a projection of the field                |
+| `r`                 | everywhere  | run the filter on the whole input (full output) |
 | `e`                 | everywhere  | edit the whole filter by hand (live preview)    |
 | `u`                 | everywhere  | undo the last change                            |
 | `X`                 | everywhere  | clear the filter                                |
@@ -122,6 +125,9 @@ keywords…) are quoted automatically: `."record-type"`.
 - In the preview, objects built by projections have their keys sorted (gojq
   behaviour); `jq` keeps construction order. Unchanged input values keep their
   original key order.
+- **`r`** uses the real `jq` when it is installed (colored output, errors and
+  exit status included), so what you see is what the exported filter does;
+  otherwise it falls back to gojq.
 - The whole input is loaded in memory. An evaluation running longer than 10 s
   is aborted, and the preview shows at most 20 outputs per input value.
 

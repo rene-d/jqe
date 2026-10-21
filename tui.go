@@ -34,6 +34,7 @@ type viewMode int
 const (
 	modeList viewMode = iota
 	modeTree
+	modeRun // full output of the filter over the whole input
 )
 
 type inputKind int
@@ -48,6 +49,11 @@ type evalMsg struct {
 	gen     int
 	results []itemResult
 	err     error
+}
+
+type runMsg struct {
+	gen int
+	res runResult
 }
 
 type treeLine struct {
@@ -80,6 +86,12 @@ type model struct {
 	collapsed        map[string]bool
 	lines            []treeLine
 	treeCur, treeOff int
+
+	run      runResult
+	runGen   int
+	running  bool
+	runOff   int
+	prevMode viewMode
 
 	input     textinput.Model
 	inputKind inputKind
@@ -134,6 +146,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+	case runMsg:
+		if msg.gen == m.runGen {
+			m.running = false
+			m.run = msg.res
+		}
 		return m, nil
 	case evalMsg:
 		if msg.gen != m.evalGen {
@@ -231,7 +249,12 @@ func (m *model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.mode == modeRun {
+		return m.updateRun(msg)
+	}
 	switch msg.String() {
+	case "r":
+		return m, m.startRun()
 	case "q":
 		m.printOnExit = true
 		return m, tea.Quit
@@ -513,9 +536,12 @@ func (m *model) View() string {
 	}
 	h := m.mainHeight()
 	var body []string
-	if m.mode == modeTree {
+	switch m.mode {
+	case modeRun:
+		body = m.runView(h)
+	case modeTree:
 		body = m.treeView(h)
-	} else {
+	default:
 		body = m.listView(h)
 	}
 	for len(body) < h {
@@ -629,6 +655,12 @@ func (m *model) statusLine() string {
 	if m.msg != "" {
 		return stMessage.Render(ansi.Truncate(m.msg, m.width, "…"))
 	}
+	if m.mode == modeRun {
+		if m.running {
+			return stDim.Render("running…")
+		}
+		return stDim.Render(fmt.Sprintf("%s · %d lines", m.run.Engine, len(m.run.Lines)))
+	}
 	if m.mode == modeTree && len(m.lines) > 0 {
 		return stDim.Render(fmt.Sprintf("value %d · %s", m.treeItem+1, formatPath(m.lines[m.treeCur].Path, false)))
 	}
@@ -641,11 +673,84 @@ func (m *model) helpLine() string {
 		return "enter: add · esc: cancel · e.g. == \"x\"  != null  > 5  | test(\"^02\")"
 	case m.inputKind == inputRaw:
 		return "enter: apply · esc: cancel · live preview"
+	case m.mode == modeRun:
+		return "↑/↓ PgUp/PgDn g/G: scroll · r: run again · esc: back · q: quit and print filter"
 	case m.mode == modeTree:
-		return "f: filter · p: project · ←/→: collapse/expand · [ ]: prev/next value · esc: list · e: edit · u: undo · a: arrays · q: quit"
+		return "f: filter · p: project · ←/→: collapse/expand · [ ]: prev/next value · esc: list · r: run · e: edit · u: undo · a: arrays · q: quit"
 	default:
-		return "enter: expand · e: edit filter · u: undo · X: clear all · a: arrays · q: quit and print filter · ctrl+c: abort"
+		return "enter: expand · r: run on the file · e: edit filter · u: undo · X: clear all · a: arrays · q: quit and print filter · ctrl+c: abort"
 	}
+}
+
+// startRun runs the current filter over the whole input and shows its output.
+func (m *model) startRun() tea.Cmd {
+	if m.mode != modeRun {
+		m.prevMode = m.mode
+	}
+	m.mode = modeRun
+	m.running = true
+	m.runOff = 0
+	m.runGen++
+	gen, filter, items := m.runGen, m.b.Filter(), m.items
+	return func() tea.Msg {
+		return runMsg{gen: gen, res: runFilter(context.Background(), filter, items)}
+	}
+}
+
+func (m *model) runLines() []string {
+	lines := m.run.Lines
+	if m.run.Err != "" {
+		for _, l := range strings.Split(m.run.Err, "\n") {
+			lines = append(lines, stErr.Render(l))
+		}
+	}
+	return lines
+}
+
+func (m *model) updateRun(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	h := m.mainHeight()
+	switch msg.String() {
+	case "q":
+		m.printOnExit = true
+		return m, tea.Quit
+	case "esc", "backspace":
+		m.mode = m.prevMode
+		m.runGen++ // ignore a run still in progress
+		m.running = false
+		return m, nil
+	case "r":
+		return m, m.startRun()
+	case "up", "k":
+		m.runOff--
+	case "down", "j":
+		m.runOff++
+	case "pgup", "ctrl+b":
+		m.runOff -= h
+	case "pgdown", "ctrl+f", " ":
+		m.runOff += h
+	case "home", "g":
+		m.runOff = 0
+	case "end", "G":
+		m.runOff = len(m.runLines()) - h
+	}
+	m.runOff = clamp(m.runOff, 0, max(0, len(m.runLines())-h))
+	return m, nil
+}
+
+func (m *model) runView(h int) []string {
+	if m.running {
+		return []string{stDim.Render("  running the filter on the whole input…")}
+	}
+	lines := m.runLines()
+	if len(lines) == 0 {
+		return []string{stDim.Render("  no output")}
+	}
+	var out []string
+	for k := m.runOff; k < len(lines) && k < m.runOff+h; k++ {
+		// Reset at the end of each line: jq colors may span several lines.
+		out = append(out, ansi.Truncate(lines[k], m.width, "…")+"\x1b[0m")
+	}
+	return out
 }
 
 // ---- Helpers ----
