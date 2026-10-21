@@ -1,5 +1,8 @@
 # jqe
 
+[![CI](https://github.com/rene-d/jqe/actions/workflows/ci.yml/badge.svg)](https://github.com/rene-d/jqe/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/rene-d/jqe)](https://github.com/rene-d/jqe/releases/latest)
+
 An interactive terminal editor for [jq](https://jqlang.org) filters.
 
 Point `jqe` at a file containing one or more JSON values (JSON Lines or simply
@@ -16,11 +19,17 @@ jq> select(.header.sequenceNumber > 0) | .header.session.id
 
 ## Install
 
+Download a prebuilt binary (Linux amd64, macOS arm64, Windows amd64) from the
+[latest release](https://github.com/rene-d/jqe/releases/latest), or build it
+with Go 1.24 or later:
+
 ```sh
 go install github.com/rene-d/jqe@latest
 ```
 
-Requires Go 1.24 or later. The jq engine ([gojq](https://github.com/itchyny/gojq))
+Check the installed version with `jqe -version`.
+
+The jq engine ([gojq](https://github.com/itchyny/gojq))
 is embedded, so `jq` itself is not needed — but if it is installed, `jqe` uses it
 to double-check the final filter.
 
@@ -124,3 +133,14 @@ go build
 ```
 
 Sample data lives in [`testdata/sample.jsonl`](testdata/sample.jsonl).
+
+Pushing a `v*` tag runs the tests and publishes a GitHub release with the
+binaries and their SHA-256 checksums:
+
+```sh
+git tag v0.1.1 && git push origin v0.1.1
+```
+
+## License
+
+[MIT](LICENSE)

@@ -13,20 +13,40 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// version is set at build time by the release workflow (-ldflags "-X main.version=…").
+var version = ""
+
+// versionString falls back to the module version recorded by go install.
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
+}
+
 func main() {
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	initial := flag.String("e", "", "initial jq filter (edited by hand)")
 	output := flag.String("o", "", "write the final filter's results to this file (one value per line, like jq -c)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: jqe [-e filter] [-o output.json] [file.json | -]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: jqe [-e filter] [-o output.json] [-version] [file.json | -]\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("jqe", versionString())
+		return
+	}
 	if err := run(flag.Arg(0), *initial, *output); err != nil {
 		fmt.Fprintln(os.Stderr, "jqe:", err)
 		os.Exit(1)
