@@ -30,11 +30,17 @@ var jqKeywords = map[string]bool{
 
 // formatPath writes a path in jq syntax; with all, indices become [].
 func formatPath(p []Seg, all bool) string {
+	return formatPathOpt(p, all, nil)
+}
+
+// formatPathOpt is formatPath where opt[i] makes segment i optional (?): no
+// error when the value it goes into is null or of another type.
+func formatPathOpt(p []Seg, all bool, opt []bool) string {
 	if len(p) == 0 {
 		return "."
 	}
 	var sb strings.Builder
-	for _, s := range p {
+	for i, s := range p {
 		switch {
 		case s.IsIndex && all:
 			sb.WriteString("[]")
@@ -45,9 +51,15 @@ func formatPath(p []Seg, all bool) string {
 		default:
 			sb.WriteString("." + quoteJSON(s.Key))
 		}
+		if i < len(opt) && opt[i] {
+			sb.WriteString("?")
+		}
 	}
 	return sb.String()
 }
+
+// shapeKey identifies a node whatever the array indices on its path.
+func shapeKey(p []Seg) string { return formatPath(p, true) }
 
 func hasIndex(p []Seg) bool {
 	for _, s := range p {
@@ -59,24 +71,32 @@ func hasIndex(p []Seg) bool {
 }
 
 // condExpr builds the boolean expression "path + test". In all mode, each
-// array level becomes any(gen; cond): one matching element is enough.
-func condExpr(p []Seg, test string, all bool) string {
+// array level becomes any(gen; cond): one matching element is enough. opt
+// marks optional segments, as for formatPathOpt (nil: none).
+func condExpr(p []Seg, test string, all bool, opt []bool) string {
 	if all {
 		for i, s := range p {
 			if s.IsIndex {
-				gen := formatPath(p[:i], false)
-				return fmt.Sprintf("any(%s[]; %s)", gen, condExpr(p[i+1:], test, all))
+				gen := formatPathOpt(p[:i], false, opt) + "[]"
+				if i < len(opt) && opt[i] {
+					gen += "?"
+				}
+				var rest []bool
+				if i+1 < len(opt) {
+					rest = opt[i+1:]
+				}
+				return fmt.Sprintf("any(%s; %s)", gen, condExpr(p[i+1:], test, all, rest))
 			}
 		}
 	}
-	return formatPath(p, false) + " " + test
+	return formatPathOpt(p, false, opt) + " " + test
 }
 
-func projExpr(p proj) string {
+func projExpr(p proj, opt []bool) string {
 	if p.All && hasIndex(p.Path) {
-		return "[" + formatPath(p.Path, true) + "]"
+		return "[" + formatPathOpt(p.Path, true, opt) + "]"
 	}
-	return formatPath(p.Path, false)
+	return formatPathOpt(p.Path, false, opt)
 }
 
 // projName returns a projection's field name: the last key of the path.
@@ -92,7 +112,7 @@ func projName(p []Seg) string {
 type cond struct {
 	Path []Seg
 	All  bool
-	Text string // full expression: select(...)
+	Test string // what follows the path: "== 5", "| test(\"x\")"…
 }
 
 type proj struct {
@@ -104,16 +124,39 @@ type proj struct {
 type builder struct {
 	Conds []cond
 	Projs []proj
-	IsRaw bool   // filter edited by hand
-	Raw   string // text of the hand-edited filter
+	Opts  map[string]bool // optional nodes, by shapeKey: going into them never fails
+	IsRaw bool            // filter edited by hand
+	Raw   string          // text of the hand-edited filter
 }
 
 func (b builder) clone() builder {
 	c := b
 	c.Conds = append([]cond(nil), b.Conds...)
 	c.Projs = append([]proj(nil), b.Projs...)
+	c.Opts = make(map[string]bool, len(b.Opts))
+	for k, v := range b.Opts {
+		c.Opts[k] = v
+	}
 	return c
 }
+
+// optFlags tells, for each segment of p, whether it goes into an optional node.
+func (b builder) optFlags(p []Seg) []bool {
+	if len(b.Opts) == 0 {
+		return nil
+	}
+	opt := make([]bool, len(p))
+	for i := range p {
+		opt[i] = b.Opts[shapeKey(p[:i])]
+	}
+	return opt
+}
+
+func (b builder) condText(c cond) string {
+	return "select(" + condExpr(c.Path, c.Test, c.All, b.optFlags(c.Path)) + ")"
+}
+
+func (b builder) projText(p proj) string { return projExpr(p, b.optFlags(p.Path)) }
 
 func (b builder) Filter() string {
 	if b.IsRaw {
@@ -121,12 +164,12 @@ func (b builder) Filter() string {
 	}
 	var parts []string
 	for _, c := range b.Conds {
-		parts = append(parts, c.Text)
+		parts = append(parts, b.condText(c))
 	}
 	switch len(b.Projs) {
 	case 0:
 	case 1:
-		parts = append(parts, projExpr(b.Projs[0]))
+		parts = append(parts, b.projText(b.Projs[0]))
 	default:
 		seen := map[string]int{}
 		var fields []string
@@ -136,7 +179,7 @@ func (b builder) Filter() string {
 			if n := seen[name]; n > 1 {
 				name = fmt.Sprintf("%s_%d", name, n)
 			}
-			fields = append(fields, quoteJSON(name)+": "+projExpr(p))
+			fields = append(fields, quoteJSON(name)+": "+b.projText(p))
 		}
 		parts = append(parts, "{"+strings.Join(fields, ", ")+"}")
 	}

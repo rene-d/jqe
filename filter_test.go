@@ -46,13 +46,38 @@ func TestFormatPath(t *testing.T) {
 }
 
 func TestCondExpr(t *testing.T) {
-	got := condExpr(path("a", 0, "b", 2, "c"), `== "x"`, true)
+	got := condExpr(path("a", 0, "b", 2, "c"), `== "x"`, true, nil)
 	want := `any(.a[]; any(.b[]; .c == "x"))`
 	if got != want {
 		t.Errorf("got %s, want %s", got, want)
 	}
-	if got := condExpr(path(0), "> 1", true); got != "any(.[]; . > 1)" {
+	if got := condExpr(path(0), "> 1", true, nil); got != "any(.[]; . > 1)" {
 		t.Errorf("root array: %s", got)
+	}
+}
+
+func TestOptional(t *testing.T) {
+	b := builder{Opts: map[string]bool{
+		".payload.records":                     true, // array: [] becomes []?
+		".payload.records[].details.parties[]": true, // object: .role becomes .role?
+	}}
+	opt := b.optFlags(role)
+	if got, want := formatPathOpt(role, false, opt), ".payload.records[0]?.details.parties[1].role?"; got != want {
+		t.Errorf("exact: got %s, want %s", got, want)
+	}
+	b.Conds = []cond{{Path: role, All: true, Test: `== "x"`}}
+	b.Projs = []proj{{Path: role, All: true}}
+	want := `select(any(.payload.records[]?; any(.details.parties[]; .role? == "x"))) | [.payload.records[]?.details.parties[].role?]`
+	if got := b.Filter(); got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+	if _, err := compile(b.Filter()); err != nil {
+		t.Error(err)
+	}
+	c := b.clone()
+	delete(c.Opts, ".payload.records")
+	if !b.Opts[".payload.records"] {
+		t.Error("clone shares the optional nodes")
 	}
 }
 
@@ -60,7 +85,7 @@ var role = path("payload", "records", 0, "details", "parties", 1, "role")
 
 func TestBuilderFilter(t *testing.T) {
 	b := builder{
-		Conds: []cond{{Text: "select(" + condExpr(path("header", "sequenceNumber"), "== 0", false) + ")"}},
+		Conds: []cond{{Path: path("header", "sequenceNumber"), Test: "== 0"}},
 		Projs: []proj{{Path: path("header", "session", "id")}},
 	}
 	want := "select(.header.sequenceNumber == 0) | .header.session.id"
@@ -93,7 +118,8 @@ func TestAgainstJq(t *testing.T) {
 		".",
 		"select(.header.sequenceNumber == 0) | .header.session.id",
 		"select(.header.sequenceNumber == 100)",
-		"select(" + condExpr(role, `== "terminating"`, true) + ")",
+		"select(" + condExpr(role, `== "terminating"`, true, nil) + ")",
+		builder{Opts: map[string]bool{".payload.records": true}, Conds: []cond{{Path: role, All: true, Test: `== "terminating"`}}}.Filter(),
 		builder{Projs: []proj{{Path: role, All: true}, {Path: path("header", "timeStamp")}}}.Filter(),
 	}
 	for _, filter := range filters {

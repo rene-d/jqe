@@ -26,6 +26,7 @@ var (
 	stNull    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	stCondMk  = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 	stProjMk  = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	stOptMk   = lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true)
 	stMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 )
 
@@ -34,7 +35,6 @@ type viewMode int
 const (
 	modeList viewMode = iota
 	modeTree
-	modeRun // full output of the filter over the whole input
 )
 
 type inputKind int
@@ -87,11 +87,15 @@ type model struct {
 	lines            []treeLine
 	treeCur, treeOff int
 
-	run      runResult
-	runGen   int
-	running  bool
-	runOff   int
-	prevMode viewMode
+	// Bottom pane: full output of the filter over the whole input.
+	runOpen   bool
+	runFocus  bool // keys go to the bottom pane
+	run       runResult
+	ranFilter string // filter that produced run
+	runGen    int
+	running   bool
+	runCancel context.CancelFunc
+	runOff    int
 
 	input     textinput.Model
 	inputKind inputKind
@@ -151,6 +155,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen == m.runGen {
 			m.running = false
 			m.run = msg.res
+			m.runOff = clamp(m.runOff, 0, max(0, len(m.runLines())-m.runHeight()))
 		}
 		return m, nil
 	case evalMsg:
@@ -170,6 +175,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.listCur = clamp(m.listCur, 0, len(m.matched)-1)
+		// Keep the bottom pane in sync with the filter once it is applied.
+		if m.runOpen && m.inputKind == inputNone && m.compileErr == "" && m.b.Filter() != m.ranFilter {
+			return m, m.startRun()
+		}
 		return m, nil
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
@@ -217,8 +226,8 @@ func (m *model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			all := m.condAll && hasIndex(m.condPath)
-			c := cond{Path: m.condPath, All: all, Text: "select(" + condExpr(m.condPath, text, all) + ")"}
-			if _, err := compile(c.Text); err != nil {
+			c := cond{Path: m.condPath, All: all, Test: text}
+			if _, err := compile(m.b.condText(c)); err != nil {
 				m.msg = "Invalid condition: " + err.Error()
 				return m, nil
 			}
@@ -249,12 +258,17 @@ func (m *model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.mode == modeRun {
+	if m.runOpen && m.runFocus {
 		return m.updateRun(msg)
 	}
 	switch msg.String() {
 	case "r":
 		return m, m.startRun()
+	case "tab":
+		if m.runOpen {
+			m.runFocus = true
+		}
+		return m, nil
 	case "q":
 		m.printOnExit = true
 		return m, tea.Quit
@@ -291,8 +305,26 @@ func (m *model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m.updateList(msg)
 }
 
+// paneHeights splits the space between the top pane (list or tree) and the
+// run output; run is 0 when the bottom pane is closed. A separator line sits
+// between them.
+func (m *model) paneHeights() (top, run int) {
+	avail := max(1, m.height-len(m.topLines())-2)
+	if !m.runOpen {
+		return avail, 0
+	}
+	run = max(1, (avail-1)/2)
+	return max(1, avail-1-run), run
+}
+
 func (m *model) mainHeight() int {
-	return max(1, m.height-len(m.topLines())-2)
+	top, _ := m.paneHeights()
+	return top
+}
+
+func (m *model) runHeight() int {
+	_, run := m.paneHeights()
+	return run
 }
 
 func (m *model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -314,6 +346,8 @@ func (m *model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.matched) > 0 {
 			m.openTree(m.matched[m.listCur])
 		}
+	case "esc":
+		m.closeRun()
 	}
 	m.listCur = clamp(m.listCur, 0, len(m.matched)-1)
 	return m, nil
@@ -428,6 +462,15 @@ func (m *model) updateTree(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			break
 		}
 		return m, m.toggleProj(line.Path)
+	case "o":
+		if line == nil {
+			break
+		}
+		if m.b.IsRaw {
+			m.msg = "Filter edited by hand: u to undo, X to start over."
+			break
+		}
+		return m, m.toggleOpt(line.Path)
 	}
 	m.treeCur = clamp(m.treeCur, 0, len(m.lines)-1)
 	return m, nil
@@ -440,13 +483,28 @@ func (m *model) toggleProj(path []Seg) tea.Cmd {
 	for i, p := range nb.Projs {
 		if formatPath(p.Path, p.All) == key {
 			nb.Projs = append(nb.Projs[:i], nb.Projs[i+1:]...)
-			m.msg = "Projection removed: " + projExpr(p)
+			m.msg = "Projection removed: " + m.b.projText(p)
 			return m.setBuilder(nb)
 		}
 	}
 	p := proj{Path: path, All: all}
 	nb.Projs = append(nb.Projs, p)
-	m.msg = "Projection added: " + projExpr(p)
+	m.msg = "Projection added: " + nb.projText(p)
+	return m.setBuilder(nb)
+}
+
+// toggleOpt marks a node as optional: paths going into it get a ?, so a
+// value where it is missing, null or of another type no longer fails.
+func (m *model) toggleOpt(path []Seg) tea.Cmd {
+	key := shapeKey(path)
+	nb := m.b.clone()
+	if nb.Opts[key] {
+		delete(nb.Opts, key)
+		m.msg = "No longer optional: " + key
+	} else {
+		nb.Opts[key] = true
+		m.msg = "Optional: " + key + " (paths going into it get a ?)"
+	}
 	return m.setBuilder(nb)
 }
 
@@ -534,18 +592,23 @@ func (m *model) View() string {
 	for _, l := range m.topLines() {
 		sb.WriteString(l + "\n")
 	}
-	h := m.mainHeight()
+	top, run := m.paneHeights()
 	var body []string
-	switch m.mode {
-	case modeRun:
-		body = m.runView(h)
-	case modeTree:
-		body = m.treeView(h)
-	default:
-		body = m.listView(h)
+	if m.mode == modeTree {
+		body = m.treeView(top)
+	} else {
+		body = m.listView(top)
 	}
-	for len(body) < h {
+	for len(body) < top {
 		body = append(body, "")
+	}
+	if m.runOpen {
+		body = append(body, m.runSeparator())
+		out := m.runView(run)
+		for len(out) < run {
+			out = append(out, "")
+		}
+		body = append(body, out...)
 	}
 	sb.WriteString(strings.Join(body, "\n") + "\n")
 	sb.WriteString(m.statusLine() + "\n")
@@ -595,6 +658,10 @@ func (m *model) treeView(h int) []string {
 		l := m.lines[k]
 		indent := strings.Repeat("  ", l.Depth)
 		var value, plain string
+		optMk := ""
+		if m.b.Opts[shapeKey(l.Path)] {
+			optMk = "?"
+		}
 		n := l.Node
 		switch {
 		case n.IsContainer():
@@ -619,16 +686,16 @@ func (m *model) treeView(h int) []string {
 			case KNumber, KBool:
 				st = stNumber
 			}
-			avail := max(1, m.width-2-len(indent)-ansi.StringWidth(l.Label)-2)
+			avail := max(1, m.width-2-len(indent)-ansi.StringWidth(l.Label+optMk)-2)
 			plain = ansi.Truncate(plain, avail, "…")
 			value = st.Render(plain)
 		}
 		mk := m.marker(l.Path)
 		if k == m.treeCur {
-			text := padRight(indent+l.Label+": "+plain, m.width-2)
+			text := padRight(indent+l.Label+optMk+": "+plain, m.width-2)
 			out = append(out, mk+" "+stCursor.Render(text))
 		} else {
-			out = append(out, mk+" "+indent+stKey.Render(l.Label)+": "+value)
+			out = append(out, mk+" "+indent+stKey.Render(l.Label)+stOptMk.Render(optMk)+": "+value)
 		}
 	}
 	return out
@@ -655,11 +722,9 @@ func (m *model) statusLine() string {
 	if m.msg != "" {
 		return stMessage.Render(ansi.Truncate(m.msg, m.width, "…"))
 	}
-	if m.mode == modeRun {
-		if m.running {
-			return stDim.Render("running…")
-		}
-		return stDim.Render(fmt.Sprintf("%s · %d lines", m.run.Engine, len(m.run.Lines)))
+	if m.runOpen && m.runFocus {
+		// The filter that produced the output shown in the bottom pane.
+		return stFilter.Render(ansi.Truncate("ran> "+m.ranFilter, m.width, "…"))
 	}
 	if m.mode == modeTree && len(m.lines) > 0 {
 		return stDim.Render(fmt.Sprintf("value %d · %s", m.treeItem+1, formatPath(m.lines[m.treeCur].Path, false)))
@@ -673,28 +738,69 @@ func (m *model) helpLine() string {
 		return "enter: add · esc: cancel · e.g. == \"x\"  != null  > 5  | test(\"^02\")"
 	case m.inputKind == inputRaw:
 		return "enter: apply · esc: cancel · live preview"
-	case m.mode == modeRun:
-		return "↑/↓ PgUp/PgDn g/G: scroll · r: run again · esc: back · q: quit and print filter"
+	case m.runOpen && m.runFocus:
+		return "↑/↓ PgUp/PgDn g/G: scroll output · tab: back to the filter · r: run again · esc: close output · q: quit and print filter"
 	case m.mode == modeTree:
-		return "f: filter · p: project · ←/→: collapse/expand · [ ]: prev/next value · esc: list · r: run · e: edit · u: undo · a: arrays · q: quit"
+		return "f: filter · p: project · o: optional · ←/→: collapse/expand · [ ]: prev/next value · esc: list · " + m.runHelp() + " · e: edit · u: undo · a: arrays · q: quit"
 	default:
-		return "enter: expand · r: run on the file · e: edit filter · u: undo · X: clear all · a: arrays · q: quit and print filter · ctrl+c: abort"
+		help := "enter: expand · " + m.runHelp() + " · e: edit filter · u: undo · X: clear all · a: arrays · q: quit and print filter · ctrl+c: abort"
+		if m.runOpen {
+			help = strings.Replace(help, "enter: expand · ", "enter: expand · esc: close output · ", 1)
+		}
+		return help
 	}
 }
 
-// startRun runs the current filter over the whole input and shows its output.
-func (m *model) startRun() tea.Cmd {
-	if m.mode != modeRun {
-		m.prevMode = m.mode
+func (m *model) runHelp() string {
+	if m.runOpen {
+		return "tab: scroll output"
 	}
-	m.mode = modeRun
+	return "r: run on the file"
+}
+
+// startRun runs the current filter over the whole input and shows its output
+// in the bottom pane; a newer run cancels the previous one. The previous output
+// stays on screen until the new one arrives.
+func (m *model) startRun() tea.Cmd {
+	if m.runCancel != nil {
+		m.runCancel()
+	}
+	m.runOpen = true
 	m.running = true
-	m.runOff = 0
 	m.runGen++
 	gen, filter, items := m.runGen, m.b.Filter(), m.items
+	m.ranFilter = filter
+	ctx, cancel := context.WithCancel(context.Background())
+	m.runCancel = cancel
 	return func() tea.Msg {
-		return runMsg{gen: gen, res: runFilter(context.Background(), filter, items)}
+		defer cancel()
+		return runMsg{gen: gen, res: runFilter(ctx, filter, items)}
 	}
+}
+
+func (m *model) closeRun() {
+	if m.runCancel != nil {
+		m.runCancel()
+	}
+	m.runGen++ // ignore a run still in progress
+	m.runOpen, m.runFocus, m.running = false, false, false
+}
+
+// runSeparator is the title bar of the bottom pane, highlighted when it has the focus.
+func (m *model) runSeparator() string {
+	title := " output"
+	if m.running {
+		title += " · running…"
+	} else if m.run.Engine != "" {
+		title += fmt.Sprintf(" · %s · %d lines", m.run.Engine, len(m.run.Lines))
+		if n := len(m.runLines()); n > m.runHeight() {
+			title += fmt.Sprintf(" · %d-%d", m.runOff+1, min(n, m.runOff+m.runHeight()))
+		}
+	}
+	if m.runFocus {
+		return stHeader.Render(padRight("▼"+title+" · tab: back to the filter", m.width))
+	}
+	return stDim.Render(padRight("─"+title+" "+strings.Repeat("─", m.width), m.width))
 }
 
 func (m *model) runLines() []string {
@@ -708,15 +814,16 @@ func (m *model) runLines() []string {
 }
 
 func (m *model) updateRun(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	h := m.mainHeight()
+	h := m.runHeight()
 	switch msg.String() {
 	case "q":
 		m.printOnExit = true
 		return m, tea.Quit
+	case "tab":
+		m.runFocus = false
+		return m, nil
 	case "esc", "backspace":
-		m.mode = m.prevMode
-		m.runGen++ // ignore a run still in progress
-		m.running = false
+		m.closeRun()
 		return m, nil
 	case "r":
 		return m, m.startRun()
@@ -738,10 +845,10 @@ func (m *model) updateRun(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) runView(h int) []string {
-	if m.running {
+	lines := m.runLines()
+	if m.running && len(lines) == 0 {
 		return []string{stDim.Render("  running the filter on the whole input…")}
 	}
-	lines := m.runLines()
 	if len(lines) == 0 {
 		return []string{stDim.Render("  no output")}
 	}

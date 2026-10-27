@@ -64,10 +64,14 @@ A ready-to-paste command line (`jq '…' 'data.json'`) is also printed to stderr
      `| test("^02")`, `| startswith("eu")`… This adds `select(<path> <test>)`.
    - **`p`** to toggle a projection. One projection outputs the field itself;
      several build an object `{"name": .path, …}`.
+   - **`o`** to mark the node as optional (see below).
 
-   Fields used in the filter are marked with **●** (condition) or **◆** (projection).
-4. Press **`r`** to run the filter on the whole input and scroll through the
-   complete output, exactly as `jq` prints it (`esc` to come back).
+   Fields used in the filter are marked with **●** (condition) or **◆**
+   (projection), optional nodes with a **?** after their name.
+4. Press **`r`** to run the filter on the whole input: the window splits, with
+   the list or tree on top and the complete output below, exactly as `jq`
+   prints it. The output is refreshed each time the filter changes; **`Tab`**
+   moves the focus to it to scroll, and back (`esc` closes it).
 5. Press **`q`** to quit and print the filter.
 
 Conditions are chained (logical AND); projections come last:
@@ -88,6 +92,22 @@ rather than the exact index you are looking at:
 Projections become `[.payload.records[].details.parties[].role]`. Press **`a`**
 (or **`ctrl+a`** while typing a condition) to switch to exact indices (`[0]`).
 
+### Optional nodes
+
+A path fails on a value where a node it goes through is not what it expects:
+`.payload.records[]` raises *Cannot iterate over null* when `records` is
+missing. Press **`o`** on such a node to mark it as optional: every path going
+into it gets a `?` and no longer fails (the value is simply not kept, or the
+projection outputs nothing for it).
+
+| Optional node      | Generated path                                 |
+| ------------------ | ---------------------------------------------- |
+| `.payload.records` | `.payload.records[]?.details.parties[].role`   |
+| `.payload`         | `.payload.records?[]…` (when `payload` may be a string, an array…) |
+
+The mark applies whatever the array indices on the path, also to conditions
+and projections added before it. Press **`o`** again to remove it.
+
 Keys that are not plain identifiers (`record-type`, `iRI-CS-Parameters`, jq
 keywords…) are quoted automatically: `."record-type"`.
 
@@ -102,9 +122,12 @@ keywords…) are quoted automatically: `."record-type"`.
 | `Space`             | tree        | toggle collapse                                 |
 | `[` `]`             | tree        | previous / next kept value                      |
 | `Esc`               | tree        | back to the list                                |
+| `Esc`               | list        | close the output pane                           |
 | `f`                 | tree        | add a condition on the field                    |
 | `p`                 | tree        | toggle a projection of the field                |
-| `r`                 | everywhere  | run the filter on the whole input (full output) |
+| `o`                 | tree        | toggle the node as optional (`?`)               |
+| `r`                 | everywhere  | run the filter on the whole input (bottom pane) |
+| `Tab`               | output open | focus the output pane / back to the filter      |
 | `e`                 | everywhere  | edit the whole filter by hand (live preview)    |
 | `u`                 | everywhere  | undo the last change                            |
 | `X`                 | everywhere  | clear the filter                                |
