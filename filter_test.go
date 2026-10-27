@@ -256,10 +256,11 @@ func TestExportAgainstJq(t *testing.T) {
 			if err := writeAll(&ours, code, items, o); err != nil {
 				t.Fatal(err)
 			}
-			want, err := exec.Command(jq, append(o.args(), b.Filter(), sampleFile)...).Output()
+			out, err := exec.Command(jq, append(o.args(), b.Filter(), sampleFile)...).Output()
 			if err != nil {
 				t.Fatalf("jq %s: %v", b.Filter(), err)
 			}
+			want := bytes.ReplaceAll(out, []byte("\r\n"), []byte("\n")) // jq on Windows
 			if ours.String() != string(want) {
 				t.Errorf("%s\njqe: %q\njq:  %q", b.Filter(), ours.String(), want)
 			}
