@@ -37,7 +37,7 @@ func versionString() string {
 func main() {
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	initial := flag.String("e", "", "initial jq filter (edited by hand)")
-	output := flag.String("o", "", "write the final filter's results to this file (one value per line, like jq -c)")
+	output := flag.String("o", "", "write the final filter's results to this file (one value per line, like jq -c; CSV/TSV rows with an export)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: jqe [-e filter] [-o output.json] [-version] [file.json | -]\n\n")
 		flag.PrintDefaults()
@@ -97,17 +97,22 @@ func run(path, initial, output string) error {
 		return nil
 	}
 
-	filter := m.b.Filter()
+	filter, o := m.b.Filter(), m.b.opts()
 	fmt.Println(filter)
 	checkWithJq(filter)
 	file := name
 	if path == "" || path == "-" {
 		file = "-"
 	}
-	fmt.Fprintf(os.Stderr, "jq %s %s\n", shellQuote(filter), shellQuote(file))
+	// An export needs options (-r, -n): the full command line shows them.
+	cmdline := "jq"
+	for _, a := range o.args() {
+		cmdline += " " + a
+	}
+	fmt.Fprintf(os.Stderr, "%s %s %s\n", cmdline, shellQuote(filter), shellQuote(file))
 
 	if output != "" {
-		code, err := compile(filter)
+		code, err := compileOpts(filter, o, items)
 		if err != nil {
 			return err
 		}
@@ -116,7 +121,7 @@ func run(path, initial, output string) error {
 			return err
 		}
 		w := bufio.NewWriter(f)
-		if err := writeAll(w, code, items); err != nil {
+		if err := writeAll(w, code, items, o); err != nil {
 			f.Close()
 			return err
 		}

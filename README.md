@@ -65,6 +65,7 @@ A ready-to-paste command line (`jq '…' 'data.json'`) is also printed to stderr
    - **`p`** to toggle a projection. One projection outputs the field itself;
      several build an object `{"name": .path, …}`.
    - **`o`** to mark the node as optional (see below).
+   - **`x`** to export the projections as CSV or TSV (see below).
 
    Fields used in the filter are marked with **●** (condition) or **◆**
    (projection), optional nodes with a **?** after their name.
@@ -108,6 +109,31 @@ projection outputs nothing for it).
 The mark applies whatever the array indices on the path, also to conditions
 and projections added before it. Press **`o`** again to remove it.
 
+### CSV / TSV export
+
+Once there is at least one projection, press **`x`** and pick a format:
+`1` CSV with a header, `2` CSV, `3` TSV with a header, `4` TSV, `0` off. The
+projections then become the columns of a row instead of an object:
+
+```sh
+# CSV: jq -r
+jq -r 'select(…) | [.header.session.id, .header.session.region] | @csv' data.jsonl
+# CSV with a header: jq -rn, the values are read with inputs
+jq -rn '["id", "region"], (inputs | select(…) | [.header.session.id, .header.session.region]) | @csv' data.jsonl
+```
+
+- Column names are the projection names (`id`, `id_2` when repeated).
+- An "any element" projection (`[.records[].role]`) is a list: its elements
+  are joined in one cell with `;` (`@csv` rejects arrays).
+- The options needed (`-r`, `-rn`) are shown in the prompt (`jq -rn>`) and in
+  the command line printed on exit; `-o` writes the CSV/TSV rows.
+- The list shows the rows; the header appears in the output of **`r`**. When
+  the export fails (a cell is an object, which `@csv` rejects), **`r`** also
+  shows the standard output of the filter without the export, to see which
+  column is the culprit.
+- Editing the filter by hand (`e`) keeps the raw output (`-r`) but drops the
+  header, since the filter is then applied to each value.
+
 Keys that are not plain identifiers (`record-type`, `iRI-CS-Parameters`, jq
 keywords…) are quoted automatically: `."record-type"`.
 
@@ -126,6 +152,7 @@ keywords…) are quoted automatically: `."record-type"`.
 | `f`                 | tree        | add a condition on the field                    |
 | `p`                 | tree        | toggle a projection of the field                |
 | `o`                 | tree        | toggle the node as optional (`?`)               |
+| `x`                 | everywhere  | export as CSV / TSV, with or without a header   |
 | `r`                 | everywhere  | run the filter on the whole input (bottom pane) |
 | `Tab`               | output open | focus the output pane / back to the filter      |
 | `e`                 | everywhere  | edit the whole filter by hand (live preview)    |

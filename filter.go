@@ -127,7 +127,37 @@ type builder struct {
 	Opts  map[string]bool // optional nodes, by shapeKey: going into them never fails
 	IsRaw bool            // filter edited by hand
 	Raw   string          // text of the hand-edited filter
+
+	// Export turns the projections into rows: "csv", "tsv" or "" (off). With
+	// Header, a first row gives the column names; this needs jq -n.
+	Export string
+	Header bool
 }
+
+// jqOpts are the jq options the filter needs: -r (raw strings) and -n (the
+// filter reads its input with inputs).
+type jqOpts struct{ Raw, Null bool }
+
+func (o jqOpts) args() []string {
+	switch {
+	case o.Raw && o.Null:
+		return []string{"-rn"}
+	case o.Raw:
+		return []string{"-r"}
+	case o.Null:
+		return []string{"-n"}
+	}
+	return nil
+}
+
+// exporting reports whether the export applies: it needs projections (or a
+// filter edited by hand from an export).
+func (b builder) exporting() bool { return b.Export != "" && (b.IsRaw || len(b.Projs) > 0) }
+
+func (b builder) header() bool { return b.exporting() && b.Header && !b.IsRaw }
+
+// opts returns the jq options for Filter.
+func (b builder) opts() jqOpts { return jqOpts{Raw: b.exporting(), Null: b.header()} }
 
 func (b builder) clone() builder {
 	c := b
@@ -158,7 +188,29 @@ func (b builder) condText(c cond) string {
 
 func (b builder) projText(p proj) string { return projExpr(p, b.optFlags(p.Path)) }
 
-func (b builder) Filter() string {
+// projNames returns the field names of the projections, numbered when repeated.
+func (b builder) projNames() []string {
+	seen := map[string]int{}
+	var names []string
+	for _, p := range b.Projs {
+		name := projName(p.Path)
+		seen[name]++
+		if n := seen[name]; n > 1 {
+			name = fmt.Sprintf("%s_%d", name, n)
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+// Filter returns the complete filter, to run with the options of opts.
+func (b builder) Filter() string { return b.build(b.header()) }
+
+// RowFilter is the filter applied to each value separately: without the
+// header of an export, which needs jq -n. The preview uses it.
+func (b builder) RowFilter() string { return b.build(false) }
+
+func (b builder) build(header bool) string {
 	if b.IsRaw {
 		return b.Raw
 	}
@@ -166,20 +218,34 @@ func (b builder) Filter() string {
 	for _, c := range b.Conds {
 		parts = append(parts, b.condText(c))
 	}
-	switch len(b.Projs) {
-	case 0:
-	case 1:
+	switch {
+	case len(b.Projs) == 0:
+	case b.exporting():
+		var cells []string
+		for _, p := range b.Projs {
+			cell := b.projText(p)
+			if p.All && hasIndex(p.Path) {
+				// Every element in one cell: @csv rejects arrays.
+				cell = "(" + cell + ` | join(";"))`
+			}
+			cells = append(cells, cell)
+		}
+		row := strings.Join(append(parts, "["+strings.Join(cells, ", ")+"]"), " | ")
+		if !header {
+			return row + " | @" + b.Export
+		}
+		var names []string
+		for _, n := range b.projNames() {
+			names = append(names, quoteJSON(n))
+		}
+		// The header comes once, before the rows: inputs reads the values with jq -n.
+		return fmt.Sprintf("[%s], (inputs | %s) | @%s", strings.Join(names, ", "), row, b.Export)
+	case len(b.Projs) == 1:
 		parts = append(parts, b.projText(b.Projs[0]))
 	default:
-		seen := map[string]int{}
 		var fields []string
-		for _, p := range b.Projs {
-			name := projName(p.Path)
-			seen[name]++
-			if n := seen[name]; n > 1 {
-				name = fmt.Sprintf("%s_%d", name, n)
-			}
-			fields = append(fields, quoteJSON(name)+": "+b.projText(p))
+		for i, name := range b.projNames() {
+			fields = append(fields, quoteJSON(name)+": "+b.projText(b.Projs[i]))
 		}
 		parts = append(parts, "{"+strings.Join(fields, ", ")+"}")
 	}
@@ -190,11 +256,33 @@ func (b builder) Filter() string {
 }
 
 func compile(filter string) (*gojq.Code, error) {
+	return compileOpts(filter, jqOpts{}, nil)
+}
+
+// compileOpts compiles the filter to run like jq with o; with -n, inputs
+// reads the items.
+func compileOpts(filter string, o jqOpts, items []Item) (*gojq.Code, error) {
 	q, err := gojq.Parse(filter)
 	if err != nil {
 		return nil, err
 	}
-	return gojq.Compile(q)
+	if !o.Null {
+		return gojq.Compile(q)
+	}
+	values := make([]any, len(items))
+	for i, it := range items {
+		values[i] = it.Value
+	}
+	return gojq.Compile(q, gojq.WithInputIter(gojq.NewIter(values...)))
+}
+
+// inputsFor returns what the filter runs on: each value separately, or once
+// null with -n.
+func inputsFor(o jqOpts, items []Item) []Item {
+	if o.Null {
+		return []Item{{Raw: []byte("null")}}
+	}
+	return items
 }
 
 // sameObject reports whether the output is the input object itself (as with select).
@@ -205,8 +293,11 @@ func sameObject(out, in any) bool {
 }
 
 // encode renders an output as compact JSON; an unchanged input object keeps
-// its key order (gojq sorts keys).
-func encode(v any, it Item) string {
+// its key order (gojq sorts keys). With raw (jq -r), strings are written as is.
+func encode(v any, it Item, raw bool) string {
+	if s, ok := v.(string); ok && raw {
+		return s
+	}
 	if sameObject(v, it.Value) {
 		return string(it.Raw)
 	}
@@ -228,7 +319,7 @@ type itemResult struct {
 func (r itemResult) kept() bool { return len(r.Outs) > 0 || r.Err != "" }
 
 // evaluate applies the filter to each value separately, like jq without -s.
-func evaluate(ctx context.Context, code *gojq.Code, items []Item) ([]itemResult, error) {
+func evaluate(ctx context.Context, code *gojq.Code, items []Item, raw bool) ([]itemResult, error) {
 	res := make([]itemResult, len(items))
 	for i, it := range items {
 		iter := code.RunWithContext(ctx, it.Value)
@@ -251,15 +342,16 @@ func evaluate(ctx context.Context, code *gojq.Code, items []Item) ([]itemResult,
 				res[i].More = true
 				break
 			}
-			res[i].Outs = append(res[i].Outs, encode(v, it))
+			res[i].Outs = append(res[i].Outs, encode(v, it, raw))
 		}
 	}
 	return res, nil
 }
 
-// writeAll writes every output of the filter, one per line, like jq -c.
-func writeAll(w io.Writer, code *gojq.Code, items []Item) error {
-	for _, it := range items {
+// writeAll writes every output of the filter, one per line, like jq -c; code
+// comes from compileOpts with the same options.
+func writeAll(w io.Writer, code *gojq.Code, items []Item, o jqOpts) error {
+	for _, it := range inputsFor(o, items) {
 		iter := code.Run(it.Value)
 		for {
 			v, ok := iter.Next()
@@ -272,7 +364,7 @@ func writeAll(w io.Writer, code *gojq.Code, items []Item) error {
 				}
 				return err
 			}
-			if _, err := fmt.Fprintln(w, encode(v, it)); err != nil {
+			if _, err := fmt.Fprintln(w, encode(v, it, o.Raw)); err != nil {
 				return err
 			}
 		}

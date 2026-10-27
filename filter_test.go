@@ -128,7 +128,7 @@ func TestAgainstJq(t *testing.T) {
 			t.Fatalf("%s: %v", filter, err)
 		}
 		var ours bytes.Buffer
-		if err := writeAll(&ours, code, items); err != nil {
+		if err := writeAll(&ours, code, items, jqOpts{}); err != nil {
 			t.Fatal(err)
 		}
 		want, err := exec.Command(jq, "-cS", filter, sampleFile).Output()
@@ -155,7 +155,7 @@ func TestKeyOrder(t *testing.T) {
 	}
 	code, _ := compile("select(.a == 2)")
 	var out bytes.Buffer
-	if err := writeAll(&out, code, items); err != nil {
+	if err := writeAll(&out, code, items, jqOpts{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := out.String(); got != "{\"b\":1,\"a\":2}\n" {
@@ -183,12 +183,12 @@ func TestRunFilter(t *testing.T) {
 	}
 	t.Run("gojq", func(t *testing.T) {
 		t.Setenv("PATH", "")
-		res := runFilter(context.Background(), "select(.a > 2)", items)
+		res := runFilter(context.Background(), "select(.a > 2)", jqOpts{}, items)
 		if res.Engine != "gojq" {
 			t.Fatalf("engine %s", res.Engine)
 		}
 		check(t, res)
-		if res := runFilter(context.Background(), ".a | error", items); !strings.Contains(res.Err, "error") {
+		if res := runFilter(context.Background(), ".a | error", jqOpts{}, items); !strings.Contains(res.Err, "error") {
 			t.Errorf("missing error: %q", res.Err)
 		}
 	})
@@ -196,6 +196,80 @@ func TestRunFilter(t *testing.T) {
 		if _, err := exec.LookPath("jq"); err != nil {
 			t.Skip("jq not found")
 		}
-		check(t, runFilter(context.Background(), "select(.a > 2)", items))
+		check(t, runFilter(context.Background(), "select(.a > 2)", jqOpts{}, items))
 	})
+}
+
+func TestExport(t *testing.T) {
+	b := builder{
+		Conds:  []cond{{Path: path("header", "sequenceNumber"), Test: "> 0"}},
+		Projs:  []proj{{Path: path("header", "session", "id")}, {Path: role, All: true}},
+		Export: "csv",
+	}
+	row := `select(.header.sequenceNumber > 0) | [.header.session.id, ([.payload.records[].details.parties[].role] | join(";"))] | @csv`
+	if got := b.Filter(); got != row {
+		t.Errorf("csv:\ngot  %s\nwant %s", got, row)
+	}
+	if o := b.opts(); !o.Raw || o.Null {
+		t.Errorf("csv options: %+v", o)
+	}
+	b.Header = true
+	want := `["id", "role"], (inputs | ` + strings.TrimSuffix(row, " | @csv") + `) | @csv`
+	if got := b.Filter(); got != want {
+		t.Errorf("csv+header:\ngot  %s\nwant %s", got, want)
+	}
+	if b.RowFilter() != row {
+		t.Errorf("row filter: %s", b.RowFilter())
+	}
+	if b.Projs = nil; b.Filter() != "select(.header.sequenceNumber > 0)" || b.opts().args() != nil {
+		t.Errorf("no projection: %s %v", b.Filter(), b.opts())
+	}
+}
+
+// TestExportAgainstJq checks the export filters with the real jq and its options.
+func TestExportAgainstJq(t *testing.T) {
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("jq not found")
+	}
+	f, err := os.Open(sampleFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	items, err := loadItems(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"csv", "tsv"} {
+		for _, header := range []bool{false, true} {
+			b := builder{
+				Projs:  []proj{{Path: path("header", "session", "id")}, {Path: path("header", "session", "region")}, {Path: role, All: true}},
+				Export: format, Header: header,
+			}
+			o := b.opts()
+			code, err := compileOpts(b.Filter(), o, items)
+			if err != nil {
+				t.Fatalf("%s: %v", b.Filter(), err)
+			}
+			var ours bytes.Buffer
+			if err := writeAll(&ours, code, items, o); err != nil {
+				t.Fatal(err)
+			}
+			want, err := exec.Command(jq, append(o.args(), b.Filter(), sampleFile)...).Output()
+			if err != nil {
+				t.Fatalf("jq %s: %v", b.Filter(), err)
+			}
+			if ours.String() != string(want) {
+				t.Errorf("%s\njqe: %q\njq:  %q", b.Filter(), ours.String(), want)
+			}
+			t.Run("run "+format, func(t *testing.T) {
+				t.Setenv("PATH", "")
+				res := runFilter(context.Background(), b.Filter(), o, items)
+				if res.Err != "" || strings.Join(res.Lines, "\n")+"\n" != string(want) {
+					t.Errorf("gojq run: %q %q", res.Lines, res.Err)
+				}
+			})
+		}
+	}
 }

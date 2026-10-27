@@ -27,8 +27,8 @@ type runResult struct {
 
 // runFilter runs the filter on every input value with the real jq when it is
 // installed (colored, original key order, exactly what the exported filter
-// will do), or with gojq otherwise.
-func runFilter(ctx context.Context, filter string, items []Item) runResult {
+// will do), or with gojq otherwise. o gives the jq options the filter needs.
+func runFilter(ctx context.Context, filter string, o jqOpts, items []Item) runResult {
 	ctx, cancel := context.WithTimeout(ctx, runTimeout)
 	defer cancel()
 	var res runResult
@@ -44,7 +44,7 @@ func runFilter(ctx context.Context, filter string, items []Item) runResult {
 			in.WriteByte('\n')
 		}
 		var stderr bytes.Buffer
-		cmd := exec.CommandContext(ctx, jq, "-C", filter)
+		cmd := exec.CommandContext(ctx, jq, append(append([]string{"-C"}, o.args()...), filter)...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = &in, &out, &stderr
 		err := cmd.Run()
 		res.Err = strings.TrimSpace(stderr.String())
@@ -59,13 +59,13 @@ func runFilter(ctx context.Context, filter string, items []Item) runResult {
 		}
 	} else {
 		res.Engine = "gojq"
-		code, err := compile(filter)
+		code, err := compileOpts(filter, o, items)
 		if err != nil {
 			res.Err = err.Error()
 			return res
 		}
 		var errs []string
-		for _, it := range items {
+		for _, it := range inputsFor(o, items) {
 			iter := code.RunWithContext(ctx, it.Value)
 			for {
 				v, ok := iter.Next()
@@ -80,8 +80,12 @@ func runFilter(ctx context.Context, filter string, items []Item) runResult {
 					errs = append(errs, "error: "+err.Error())
 					break
 				}
+				if s, ok := v.(string); ok && o.Raw {
+					out.WriteString(s + "\n")
+					continue
+				}
 				var buf bytes.Buffer
-				if err := json.Indent(&buf, []byte(encode(v, it)), "", "  "); err != nil {
+				if err := json.Indent(&buf, []byte(encode(v, it, false)), "", "  "); err != nil {
 					errs = append(errs, "error: "+err.Error())
 					continue
 				}

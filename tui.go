@@ -54,6 +54,7 @@ type evalMsg struct {
 type runMsg struct {
 	gen int
 	res runResult
+	std *runResult // failed export: the same filter without the export
 }
 
 type treeLine struct {
@@ -91,7 +92,8 @@ type model struct {
 	runOpen   bool
 	runFocus  bool // keys go to the bottom pane
 	run       runResult
-	ranFilter string // filter that produced run
+	runStd    *runResult // standard output shown when an export fails
+	ranFilter string     // filter that produced run
 	runGen    int
 	running   bool
 	runCancel context.CancelFunc
@@ -101,6 +103,8 @@ type model struct {
 	inputKind inputKind
 	condPath  []Seg
 	condAll   bool
+
+	exportMenu bool // x pressed: waiting for the export format
 
 	msg           string
 	width, height int
@@ -113,7 +117,7 @@ func newModel(file string, items []Item, b builder) *model {
 	return &model{file: file, items: items, b: b, allMode: true, input: ti, width: 80, height: 24}
 }
 
-func (m *model) Init() tea.Cmd { return m.startEval(m.b.Filter()) }
+func (m *model) Init() tea.Cmd { return m.startEval(m.b.RowFilter()) }
 
 // startEval runs the evaluation in the background; a newer one cancels the previous one.
 func (m *model) startEval(filter string) tea.Cmd {
@@ -132,10 +136,10 @@ func (m *model) startEval(filter string) tea.Cmd {
 	m.evaluating = true
 	ctx, cancel := context.WithTimeout(context.Background(), evalTimeout)
 	m.cancel = cancel
-	items := m.items
+	items, raw := m.items, m.b.opts().Raw
 	return func() tea.Msg {
 		defer cancel()
-		res, err := evaluate(ctx, code, items)
+		res, err := evaluate(ctx, code, items, raw)
 		return evalMsg{gen: gen, results: res, err: err}
 	}
 }
@@ -143,7 +147,7 @@ func (m *model) startEval(filter string) tea.Cmd {
 func (m *model) setBuilder(b builder) tea.Cmd {
 	m.undo = append(m.undo, m.b.clone())
 	m.b = b
-	return m.startEval(m.b.Filter())
+	return m.startEval(m.b.RowFilter())
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -154,7 +158,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case runMsg:
 		if msg.gen == m.runGen {
 			m.running = false
-			m.run = msg.res
+			m.run, m.runStd = msg.res, msg.std
 			m.runOff = clamp(m.runOff, 0, max(0, len(m.runLines())-m.runHeight()))
 		}
 		return m, nil
@@ -209,7 +213,7 @@ func (m *model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputKind = inputNone
 		m.input.Blur()
 		if kind == inputRaw {
-			return m, m.startEval(m.b.Filter())
+			return m, m.startEval(m.b.RowFilter())
 		}
 		return m, nil
 	case "ctrl+a":
@@ -241,10 +245,14 @@ func (m *model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.inputKind = inputNone
-			if text == m.b.Filter() {
+			if text == m.b.RowFilter() {
 				return m, m.startEval(text)
 			}
-			return m, m.setBuilder(builder{IsRaw: true, Raw: text})
+			nb := builder{IsRaw: true, Raw: text}
+			if m.b.exporting() {
+				nb.Export = m.b.Export // keep the raw output (jq -r)
+			}
+			return m, m.setBuilder(nb)
 		}
 	}
 	var cmd tea.Cmd
@@ -258,6 +266,9 @@ func (m *model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.exportMenu {
+		return m.updateExport(msg)
+	}
 	if m.runOpen && m.runFocus {
 		return m.updateRun(msg)
 	}
@@ -274,16 +285,30 @@ func (m *model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "e":
 		m.inputKind = inputRaw
-		m.input.SetValue(m.b.Filter())
+		m.input.SetValue(m.b.RowFilter())
 		m.input.CursorEnd()
 		m.input.Focus()
+		if m.b.header() {
+			m.msg = "Editing by hand drops the export header (the filter is applied to each value)."
+		}
 		return m, textinput.Blink
+	case "x":
+		if m.b.IsRaw {
+			m.msg = "Filter edited by hand: u to undo, X to start over."
+			return m, nil
+		}
+		if len(m.b.Projs) == 0 {
+			m.msg = "Export needs at least one projection (p on a field in the tree)."
+			return m, nil
+		}
+		m.exportMenu = true
+		return m, nil
 	case "u":
 		if n := len(m.undo); n > 0 {
 			m.b = m.undo[n-1]
 			m.undo = m.undo[:n-1]
 			m.msg = "Undone."
-			return m, m.startEval(m.b.Filter())
+			return m, m.startEval(m.b.RowFilter())
 		}
 		m.msg = "Nothing to undo."
 		return m, nil
@@ -493,6 +518,39 @@ func (m *model) toggleProj(path []Seg) tea.Cmd {
 	return m.setBuilder(nb)
 }
 
+var exportChoices = map[string]struct {
+	format string
+	header bool
+}{
+	"1": {"csv", true}, "2": {"csv", false}, "3": {"tsv", true}, "4": {"tsv", false}, "0": {"", false},
+}
+
+func (m *model) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.exportMenu = false
+	c, ok := exportChoices[msg.String()]
+	if !ok {
+		return m, nil
+	}
+	if c.format == m.b.Export && c.header == m.b.Header {
+		return m, nil
+	}
+	nb := m.b.clone()
+	nb.Export, nb.Header = c.format, c.header
+	if c.format == "" {
+		m.msg = "Export off."
+	} else {
+		m.msg = "Export: " + exportLabel(nb) + " · run it with jq " + strings.Join(nb.opts().args(), " ")
+	}
+	return m, m.setBuilder(nb)
+}
+
+func exportLabel(b builder) string {
+	if b.Header {
+		return b.Export + "+header"
+	}
+	return b.Export
+}
+
 // toggleOpt marks a node as optional: paths going into it get a ?, so a
 // value where it is missing, null or of another type no longer fails.
 func (m *model) toggleOpt(path []Seg) tea.Cmd {
@@ -569,11 +627,23 @@ func (m *model) topLines() []string {
 	if m.b.IsRaw {
 		head += " · edited by hand"
 	}
+	switch {
+	case m.b.exporting() && m.b.IsRaw:
+		head += " · raw output (-r)"
+	case m.b.exporting():
+		head += " · export: " + exportLabel(m.b)
+	case m.b.Export != "":
+		head += " · export: " + exportLabel(m.b) + " (needs a projection)"
+	}
 	lines := []string{stHeader.Render(padRight(head, m.width))}
 	if m.inputKind == inputRaw {
 		lines = append(lines, "jq> "+m.input.View())
 	} else {
-		wrapped := strings.Split(ansi.Hardwrap("jq> "+m.b.Filter(), m.width, false), "\n")
+		prompt := "jq> "
+		if args := m.b.opts().args(); args != nil {
+			prompt = "jq " + strings.Join(args, " ") + "> "
+		}
+		wrapped := strings.Split(ansi.Hardwrap(prompt+m.b.Filter(), m.width, false), "\n")
 		if len(wrapped) > 4 {
 			wrapped = append(wrapped[:3], "…")
 		}
@@ -702,6 +772,9 @@ func (m *model) treeView(h int) []string {
 }
 
 func (m *model) statusLine() string {
+	if m.exportMenu {
+		return stCondMk.Render("export ") + "1: csv+header · 2: csv · 3: tsv+header · 4: tsv · 0: off · other key: cancel"
+	}
 	if m.inputKind == inputCond {
 		mode := "index"
 		if m.condAll {
@@ -741,9 +814,9 @@ func (m *model) helpLine() string {
 	case m.runOpen && m.runFocus:
 		return "↑/↓ PgUp/PgDn g/G: scroll output · tab: back to the filter · r: run again · esc: close output · q: quit and print filter"
 	case m.mode == modeTree:
-		return "f: filter · p: project · o: optional · ←/→: collapse/expand · [ ]: prev/next value · esc: list · " + m.runHelp() + " · e: edit · u: undo · a: arrays · q: quit"
+		return "f: filter · p: project · o: optional · x: export · ←/→: collapse/expand · [ ]: prev/next value · esc: list · " + m.runHelp() + " · e: edit · u: undo · a: arrays · q: quit"
 	default:
-		help := "enter: expand · " + m.runHelp() + " · e: edit filter · u: undo · X: clear all · a: arrays · q: quit and print filter · ctrl+c: abort"
+		help := "enter: expand · " + m.runHelp() + " · e: edit filter · x: export · u: undo · X: clear all · a: arrays · q: quit and print filter · ctrl+c: abort"
 		if m.runOpen {
 			help = strings.Replace(help, "enter: expand · ", "enter: expand · esc: close output · ", 1)
 		}
@@ -768,13 +841,24 @@ func (m *model) startRun() tea.Cmd {
 	m.runOpen = true
 	m.running = true
 	m.runGen++
-	gen, filter, items := m.runGen, m.b.Filter(), m.items
+	gen, filter, opts, items := m.runGen, m.b.Filter(), m.b.opts(), m.items
 	m.ranFilter = filter
+	var std builder
+	if m.b.exporting() && !m.b.IsRaw {
+		std = m.b.clone()
+		std.Export = ""
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.runCancel = cancel
 	return func() tea.Msg {
 		defer cancel()
-		return runMsg{gen: gen, res: runFilter(ctx, filter, items)}
+		msg := runMsg{gen: gen, res: runFilter(ctx, filter, opts, items)}
+		if msg.res.Err != "" && std.Export == "" && len(std.Projs) > 0 {
+			// Show what the projections give, to see which cell the export rejects.
+			res := runFilter(ctx, std.Filter(), std.opts(), items)
+			msg.std = &res
+		}
+		return msg
 	}
 }
 
@@ -793,6 +877,9 @@ func (m *model) runSeparator() string {
 		title += " · running…"
 	} else if m.run.Engine != "" {
 		title += fmt.Sprintf(" · %s · %d lines", m.run.Engine, len(m.run.Lines))
+		if m.runStd != nil {
+			title += " · export failed, standard output below"
+		}
 		if n := len(m.runLines()); n > m.runHeight() {
 			title += fmt.Sprintf(" · %d-%d", m.runOff+1, min(n, m.runOff+m.runHeight()))
 		}
@@ -804,10 +891,19 @@ func (m *model) runSeparator() string {
 }
 
 func (m *model) runLines() []string {
-	lines := m.run.Lines
+	lines := append([]string(nil), m.run.Lines...)
 	if m.run.Err != "" {
 		for _, l := range strings.Split(m.run.Err, "\n") {
 			lines = append(lines, stErr.Render(l))
+		}
+	}
+	if std := m.runStd; std != nil {
+		lines = append(lines, "", stDim.Render("── standard output, without the export ──"))
+		lines = append(lines, std.Lines...)
+		if std.Err != "" {
+			for _, l := range strings.Split(std.Err, "\n") {
+				lines = append(lines, stErr.Render(l))
+			}
 		}
 	}
 	return lines
